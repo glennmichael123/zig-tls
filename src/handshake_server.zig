@@ -23,6 +23,7 @@ const DhKeyPair = common.DhKeyPair;
 const CertKeyPair = common.CertKeyPair;
 const cert = common.cert;
 
+const rng = @import("random.zig");
 const log = std.log.scoped(.tls);
 
 pub const Options = struct {
@@ -147,14 +148,14 @@ pub const Handshake = struct {
     }
 
     fn initKeys(h: *Self, opt: Options) void {
-        crypto.random.bytes(&h.server_random);
+        rng.fill(&h.server_random);
         if (opt.auth) |a| {
             // required signature scheme in client hello
             h.signature_scheme = a.key.signature_scheme;
         }
         // Initialize DH key pair for key exchange (used in TLS 1.2 ECDHE)
         var seed: [DhKeyPair.seed_len]u8 = undefined;
-        crypto.random.bytes(&seed);
+        rng.fill(&seed);
         h.dh_kp = DhKeyPair.init(seed, opt.named_groups) catch unreachable;
     }
 
@@ -167,48 +168,80 @@ pub const Handshake = struct {
     fn serverFlightTls12(h: *Self, opt: Options) !void {
         var w: record.Writer = .initFromIo(h.output);
 
+        // Debug: log the selected named_group (use info level to show in production)
+        log.info("TLS 1.2 serverFlightTls12: named_group={x}, cipher_suite={x}", .{ @intFromEnum(h.named_group), @intFromEnum(h.cipher_suite) });
+
         // Generate server's DH public key
+        log.info("TLS 1.2: generating DH public key", .{});
         h.server_pub_key = try common.dupe(&h.server_pub_key_buf, try h.dh_kp.publicKey(h.named_group));
+        log.info("TLS 1.2: DH public key generated, len={d}", .{h.server_pub_key.len});
 
         // ServerHello
         {
+            log.info("TLS 1.2: making ServerHello", .{});
             const hello = try h.makeServerHelloTls12(&w);
             h.transcript.update(hello[record.header_len..]);
+            log.info("TLS 1.2: ServerHello done, pos={d}", .{w.pos()});
         }
 
         // Certificate (if auth is enabled)
         if (opt.auth) |auth| {
+            log.info("TLS 1.2: making Certificate at pos={d}", .{w.pos()});
             const cb = CertificateBuilder{
                 .cert_key_pair = auth,
                 .transcript = &h.transcript,
                 .tls_version = .tls_1_2,
                 .side = .server,
             };
-            var hw = try w.writerAdvance(record.header_len);
-            try cb.makeCertificate(&hw);
-            h.transcript.update(hw.buffered());
-            try w.record(.handshake, hw.buffered());
+            // Skip space for record header (5 bytes)
+            const header_pos = try w.skip(record.header_len);
+            const content_start = w.pos();
+            try cb.makeCertificate(&w);
+            const content_len = w.pos() - content_start;
+            h.transcript.update(w.buffered()[content_start..]);
+            // Go back and write the record header
+            var hw = w.writerAt(header_pos);
+            try hw.recordHeader(.handshake, content_len);
+            log.info("TLS 1.2: Certificate done, content_len={d}, pos={d}", .{ content_len, w.pos() });
         }
 
         // ServerKeyExchange (for ECDHE cipher suites)
         if (h.cipher_suite.keyExchange() == .ecdhe) {
             if (opt.auth) |auth| {
-                var hw = try w.writerAdvance(record.header_len);
-                try h.makeServerKeyExchange(&hw, auth);
-                h.transcript.update(hw.buffered());
-                try w.record(.handshake, hw.buffered());
+                log.info("TLS 1.2: making ServerKeyExchange at pos={d}", .{w.pos()});
+                // Skip space for record header (5 bytes)
+                const header_pos = try w.skip(record.header_len);
+                const content_start = w.pos();
+                try h.makeServerKeyExchange(&w, auth);
+                const content_len = w.pos() - content_start;
+                h.transcript.update(w.buffered()[content_start..]);
+                // Go back and write the record header
+                var hw = w.writerAt(header_pos);
+                try hw.recordHeader(.handshake, content_len);
+                log.info("TLS 1.2: ServerKeyExchange done, content_len={d}, pos={d}", .{ content_len, w.pos() });
             }
         }
 
         // ServerHelloDone
         {
-            var hw = try w.writerAdvance(record.header_len);
-            try hw.handshakeRecordHeader(.server_hello_done, 0);
-            h.transcript.update(hw.buffered());
-            try w.record(.handshake, hw.buffered());
+            log.info("TLS 1.2: making ServerHelloDone at pos={d}", .{w.pos()});
+            // Skip space for record header (5 bytes)
+            const header_pos = try w.skip(record.header_len);
+            const content_start = w.pos();
+            // ServerHelloDone is just a handshake header with 0 length body
+            try w.handshakeRecordHeader(.server_hello_done, 0);
+            const content_len = w.pos() - content_start;
+            h.transcript.update(w.buffered()[content_start..]);
+            // Go back and write the record header
+            var hw = w.writerAt(header_pos);
+            try hw.recordHeader(.handshake, content_len);
+            log.info("TLS 1.2: ServerHelloDone done, content_len={d}, pos={d}", .{ content_len, w.pos() });
         }
 
+        log.info("TLS 1.2: serverFlightTls12 complete, total bytes={d}", .{w.buffered().len});
+        log.info("TLS 1.2: h.output.end before advance={d}", .{h.output.end});
         h.output.advance(w.buffered().len);
+        log.info("TLS 1.2: h.output.end after advance={d}", .{h.output.end});
     }
 
     fn makeServerHelloTls12(h: *Self, w: *record.Writer) ![]const u8 {
@@ -223,9 +256,14 @@ pub const Handshake = struct {
         try w.enumValue(h.cipher_suite);
         try w.slice(&[_]u8{0}); // compression method (null)
 
-        // No extensions for TLS 1.2 ServerHello (basic)
-        // Extensions length = 0
-        try w.int(u16, 0);
+        // Extensions for TLS 1.2 ServerHello
+        // RFC 5746: renegotiation_info extension is required by modern clients
+        // Extension structure: type (2) + length (2) + data
+        // renegotiation_info: type=0xff01, length=1, renegotiated_connection_length=0
+        try w.int(u16, 5); // Extensions total length
+        try w.int(u16, 0xff01); // Extension type: renegotiation_info
+        try w.int(u16, 1); // Extension data length
+        try w.int(u8, 0); // renegotiated_connection length (0 for initial handshake)
 
         var hw = w.writerAt(header_pos);
         try hw.recordHeader(.handshake, w.pos() - 5);
@@ -261,21 +299,27 @@ pub const Handshake = struct {
 
         // Sign the data using the appropriate signing method based on key type
         const signature_scheme = auth.key.signature_scheme;
+        log.info("TLS 1.2 ServerKeyExchange: signature_scheme={x}, ecdsa_key_pair_present={}", .{ @intFromEnum(signature_scheme), auth.ecdsa_key_pair != null });
         try hw.enumValue(signature_scheme);
 
         const signature = switch (signature_scheme) {
             inline .ecdsa_secp256r1_sha256,
             .ecdsa_secp384r1_sha384,
             => |comptime_scheme| brk: {
+                log.info("TLS 1.2 ServerKeyExchange: entering ECDSA branch", .{});
                 const Ecdsa = common.SchemeEcdsa(comptime_scheme);
                 const key_pair = switch (comptime_scheme) {
                     .ecdsa_secp256r1_sha256 => auth.ecdsa_key_pair.?.ecdsa_secp256r1_sha256,
                     .ecdsa_secp384r1_sha384 => auth.ecdsa_key_pair.?.ecdsa_secp384r1_sha384,
                     else => unreachable,
                 };
+                log.info("TLS 1.2 ServerKeyExchange: got key_pair, creating signer", .{});
                 var signer = try key_pair.signer(null);
+                log.info("TLS 1.2 ServerKeyExchange: signer created, updating", .{});
                 signer.update(sign_data);
+                log.info("TLS 1.2 ServerKeyExchange: finalizing signature", .{});
                 const sig = try signer.finalize();
+                log.info("TLS 1.2 ServerKeyExchange: converting to DER", .{});
                 var buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
                 break :brk sig.toDer(&buf);
             },
@@ -303,51 +347,90 @@ pub const Handshake = struct {
 
     /// TLS 1.2 client flight 2: ClientKeyExchange, ChangeCipherSpec, Finished
     fn clientFlight2Tls12(h: *Self, _: Options) !void {
+        log.info("TLS 1.2 clientFlight2Tls12: starting", .{});
         // Read ClientKeyExchange
         {
-            var d = try Record.decoder(h.input);
-            try d.expectContentType(.handshake);
+            var d = Record.decoder(h.input) catch |err| {
+                log.err("TLS 1.2 clientFlight2Tls12: Record.decoder failed: {}", .{err});
+                return err;
+            };
+            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@intFromEnum(d.content_type)});
+            d.expectContentType(.handshake) catch |err| {
+                log.err("TLS 1.2 clientFlight2Tls12: expected handshake but got content_type={x}, payload_len={d}", .{ @intFromEnum(d.content_type), d.payload.len });
+                if (d.content_type == .alert and d.payload.len >= 2) {
+                    log.err("TLS 1.2 clientFlight2Tls12: client sent alert: level={d}, desc={d}", .{ d.payload[0], d.payload[1] });
+                }
+                return err;
+            };
             h.transcript.update(d.payload);
 
             const handshake_type = try d.decode(proto.Handshake);
-            if (handshake_type != .client_key_exchange) return error.TlsUnexpectedMessage;
+            log.info("TLS 1.2 clientFlight2Tls12: handshake_type={x} (decimal={d}), expected client_key_exchange={x}", .{ @intFromEnum(handshake_type), @intFromEnum(handshake_type), @intFromEnum(proto.Handshake.client_key_exchange) });
+            if (handshake_type != .client_key_exchange) {
+                log.err("TLS 1.2 clientFlight2Tls12: handshake type mismatch! got={s}, expected=client_key_exchange", .{@tagName(handshake_type)});
+                return error.TlsUnexpectedMessage;
+            }
+            log.info("TLS 1.2 clientFlight2Tls12: handshake type check passed", .{});
             const length = try d.decode(u24);
+            log.info("TLS 1.2 clientFlight2Tls12: ClientKeyExchange length={d}", .{length});
 
             // For ECDHE, client sends its public key
             if (h.cipher_suite.keyExchange() == .ecdhe) {
                 const client_pub_key_len = try d.decode(u8);
+                log.info("TLS 1.2 clientFlight2Tls12: client pub key len={d}, expected={d}", .{ client_pub_key_len, length - 1 });
                 if (client_pub_key_len != length - 1) return error.TlsDecodeError;
                 h.client_pub_key = try common.dupe(&h.client_pub_key_buf, try d.slice(client_pub_key_len));
+                log.info("TLS 1.2 clientFlight2Tls12: got client pub key, len={d}", .{h.client_pub_key.len});
             } else {
                 // RSA key exchange - skip for now
                 try d.skip(length);
             }
         }
+        log.info("TLS 1.2 clientFlight2Tls12: finished reading ClientKeyExchange", .{});
 
         // Generate pre-master secret and derive keys
         if (h.cipher_suite.keyExchange() == .ecdhe) {
+            log.info("TLS 1.2 clientFlight2Tls12: generating shared key, named_group={x}", .{@intFromEnum(h.named_group)});
             const pre_master_secret = try h.dh_kp.sharedKey(h.named_group, h.client_pub_key);
+            log.info("TLS 1.2 clientFlight2Tls12: got pre_master_secret, len={d}", .{pre_master_secret.len});
             h.transcript.masterSecret(&h.master_secret, pre_master_secret, h.client_random, h.server_random);
             h.transcript.keyMaterial(&h.key_material, &h.master_secret, h.client_random, h.server_random);
+            log.info("TLS 1.2 clientFlight2Tls12: derived keys", .{});
         }
 
         // Initialize cipher for decryption
+        log.info("TLS 1.2 clientFlight2Tls12: initializing cipher", .{});
         h.cipher = try Cipher.initTls12(h.cipher_suite, &h.key_material, .server);
+        log.info("TLS 1.2 clientFlight2Tls12: cipher initialized", .{});
 
         // Read ChangeCipherSpec
+        log.info("TLS 1.2 clientFlight2Tls12: reading ChangeCipherSpec", .{});
         {
             var d = try Record.decoder(h.input);
+            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@intFromEnum(d.content_type)});
             try d.expectContentType(.change_cipher_spec);
+            log.info("TLS 1.2 clientFlight2Tls12: ChangeCipherSpec payload_len={d}, payload[0]={d}", .{ d.payload.len, if (d.payload.len > 0) d.payload[0] else 255 });
             if (d.payload.len != 1 or d.payload[0] != 1) return error.TlsUnexpectedMessage;
         }
+        log.info("TLS 1.2 clientFlight2Tls12: ChangeCipherSpec OK", .{});
 
         // Read encrypted Finished
+        // In TLS 1.2, the encrypted Finished message uses content_type=handshake (0x16)
+        // The encryption is applied to the payload, but the record header type stays as handshake
+        log.info("TLS 1.2 clientFlight2Tls12: reading encrypted Finished", .{});
         {
             const rec = try Record.read(h.input);
-            if (rec.content_type != .application_data) return error.TlsUnexpectedMessage;
+            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@intFromEnum(rec.content_type)});
+            // TLS 1.2 encrypted Finished uses handshake (0x16) content type, NOT application_data
+            if (rec.content_type != .handshake) {
+                log.err("TLS 1.2 clientFlight2Tls12: expected handshake, got {x}", .{@intFromEnum(rec.content_type)});
+                return error.TlsUnexpectedMessage;
+            }
 
             var cleartext_buf: [128]u8 = undefined;
+            // For TLS 1.2, decrypt returns the record's content_type (which is handshake)
             const content_type, const cleartext = try h.cipher.decrypt(&cleartext_buf, rec);
+            log.info("TLS 1.2 clientFlight2Tls12: decrypted, content_type={x}, cleartext_len={d}", .{ @intFromEnum(content_type), cleartext.len });
             if (content_type != .handshake) return error.TlsUnexpectedMessage;
 
             // Parse Finished message
@@ -404,7 +487,7 @@ pub const Handshake = struct {
 
         const shared_key = brk: {
             var seed: [DhKeyPair.seed_len]u8 = undefined;
-            crypto.random.bytes(&seed);
+            rng.fill(&seed);
             var kp = try DhKeyPair.init(seed, &[_]proto.NamedGroup{h.named_group});
             h.server_pub_key = try common.dupe(&h.server_pub_key_buf, try kp.publicKey(h.named_group));
             break :brk try kp.sharedKey(h.named_group, h.client_pub_key);
@@ -606,6 +689,7 @@ pub const Handshake = struct {
     }
 
     fn readClientHello(h: *Self, supported_cipher_suites: []const CipherSuite, server_named_groups: []const proto.NamedGroup) !void {
+        log.info("readClientHello: starting to parse ClientHello", .{});
         var d = try Record.decoder(h.input);
         if (d.payload.len > max_cleartext_len) return error.TlsRecordOverflow;
         try d.expectContentType(.handshake);
@@ -621,20 +705,33 @@ pub const Handshake = struct {
             const len = try d.decode(u8);
             h.legacy_session_id = try common.dupe(&h.legacy_session_id_buf, try d.slice(len));
         }
+        // Track cipher suite candidates for both TLS versions separately
+        // This is needed because we don't know which TLS version will be used yet
+        var tls13_cipher: CipherSuite = @enumFromInt(0);
+        var tls12_cipher: CipherSuite = @enumFromInt(0);
         { // cipher suites
             const end_idx = try d.decode(u16) + d.idx;
 
             while (d.idx < end_idx) {
                 const cipher_suite = try d.decode(CipherSuite);
-                if (cipher_suites.includes(supported_cipher_suites, cipher_suite) and
-                    @intFromEnum(h.cipher_suite) == 0)
-                {
-                    h.cipher_suite = cipher_suite;
+                if (cipher_suites.includes(supported_cipher_suites, cipher_suite)) {
+                    // Track TLS 1.3 and TLS 1.2 ciphers separately
+                    if (cipher_suites.includes(cipher_suites.tls13, cipher_suite)) {
+                        if (@intFromEnum(tls13_cipher) == 0) {
+                            tls13_cipher = cipher_suite;
+                        }
+                    } else if (cipher_suites.includes(cipher_suites.tls12, cipher_suite)) {
+                        if (@intFromEnum(tls12_cipher) == 0) {
+                            tls12_cipher = cipher_suite;
+                        }
+                    }
                 }
             }
-            if (@intFromEnum(h.cipher_suite) == 0)
+            // Must have at least one supported cipher
+            if (@intFromEnum(tls13_cipher) == 0 and @intFromEnum(tls12_cipher) == 0)
                 return error.TlsNoSupportedCiphers;
         }
+        log.info("readClientHello: tls13_cipher={x}, tls12_cipher={x}", .{ @intFromEnum(tls13_cipher), @intFromEnum(tls12_cipher) });
         try d.skip(2); // compression methods
 
         var key_share_received = false;
@@ -689,10 +786,12 @@ pub const Handshake = struct {
                     while (d.idx < end_idx) {
                         const named_group = try d.decode(proto.NamedGroup);
                         switch (@intFromEnum(named_group)) {
+                            // Deprecated/insecure curves - skip silently for TLS 1.2 compatibility
+                            // Some clients (including Apple SecureTransport) may include these
                             0x0001...0x0016,
                             0x001a...0x001c,
                             0xff01...0xff02,
-                            => return error.TlsIllegalParameter,
+                            => {},
                             else => {
                                 // Store supported groups for TLS 1.2 fallback
                                 if (supported_groups_len < supported_groups_buf.len) {
@@ -725,18 +824,30 @@ pub const Handshake = struct {
         }
 
         // Determine TLS version based on client capabilities
-        if (tls_1_3_supported and key_share_received) {
-            // TLS 1.3 handshake
+        log.info("readClientHello: tls_1_3_supported={}, key_share_received={}, supported_groups_len={}", .{ tls_1_3_supported, key_share_received, supported_groups_len });
+        if (tls_1_3_supported and key_share_received and @intFromEnum(tls13_cipher) != 0) {
+            // TLS 1.3 handshake - requires TLS 1.3 cipher
             h.tls_version = .tls_1_3;
+            h.cipher_suite = tls13_cipher;
             if (@intFromEnum(h.named_group) == 0) return error.TlsIllegalParameter;
-        } else {
+        } else if (@intFromEnum(tls12_cipher) != 0) {
             // TLS 1.2 handshake - need to select named group from supported_groups
             h.tls_version = .tls_1_2;
+            h.cipher_suite = tls12_cipher;
+            log.info("readClientHello: TLS 1.2 path, cipher keyExchange={}", .{h.cipher_suite.keyExchange()});
 
             // For TLS 1.2 ECDHE, select a named group from supported_groups extension
             if (h.cipher_suite.keyExchange() == .ecdhe) {
+                // If no supported_groups extension was received, default to common curves
+                // per RFC 8422 - most TLS 1.2 clients support secp256r1/secp384r1
+                const client_groups = if (supported_groups_len > 0)
+                    supported_groups_buf[0..supported_groups_len]
+                else
+                    &[_]proto.NamedGroup{ .secp256r1, .secp384r1 };
+
+                log.info("readClientHello: client_groups count={}, server_named_groups count={}", .{ client_groups.len, server_named_groups.len });
+
                 // Find first matching named group between server and client
-                const client_groups = supported_groups_buf[0..supported_groups_len];
                 for (server_named_groups) |server_ng| {
                     for (client_groups) |client_ng| {
                         if (server_ng == client_ng) {
@@ -748,7 +859,12 @@ pub const Handshake = struct {
                 }
                 if (@intFromEnum(h.named_group) == 0) return error.TlsIllegalParameter;
             }
+            log.info("TLS 1.2 readClientHello: selected named_group={x}", .{@intFromEnum(h.named_group)});
+        } else {
+            // No compatible cipher suite found
+            return error.TlsNoSupportedCiphers;
         }
+        log.info("readClientHello complete: tls_version={}, cipher_suite={x}, named_group={x}", .{ h.tls_version, @intFromEnum(h.cipher_suite), @intFromEnum(h.named_group) });
     }
 };
 
@@ -937,6 +1053,7 @@ pub const NonBlock = struct {
             },
         }
 
+        log.info("NonBlock run() returning: recv_pos={d}, writer.end={d}, send.len={d}", .{ recv_pos, writer.end, writer.buffered().len });
         return .{
             .recv_pos = recv_pos,
             .send_pos = writer.end,

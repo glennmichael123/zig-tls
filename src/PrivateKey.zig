@@ -17,7 +17,7 @@ key: union {
 
 const PrivateKey = @This();
 
-pub fn fromFile(_: Allocator, file: std.fs.File) !PrivateKey {
+pub fn fromFile(_: Allocator, file: std.Io.File) !PrivateKey {
     // Read file using posix since Zig 0.16 File.reader requires Io context
     const fd = file.handle;
     var buf: [8192]u8 = undefined;

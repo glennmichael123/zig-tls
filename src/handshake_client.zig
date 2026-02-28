@@ -12,6 +12,7 @@ fn getMilliTimestamp() i64 {
     return ts.sec * 1000 + @divFloor(ts.nsec, std.time.ns_per_ms);
 }
 
+const rng = @import("random.zig");
 const Cipher = @import("cipher.zig").Cipher;
 const CipherSuite = @import("cipher.zig").CipherSuite;
 const cipher_suites = @import("cipher.zig").cipher_suites;
@@ -239,7 +240,7 @@ pub const Handshake = struct {
     fn initKeys(h: *Self, opt: Options) !void {
         const init_keys_buf_len = 32 + 46 + DhKeyPair.seed_len;
         var buf: [init_keys_buf_len]u8 = undefined;
-        crypto.random.bytes(&buf);
+        rng.fill(&buf);
 
         h.client_random = buf[0..32].*;
         h.rsa_secret = RsaSecret.init(buf[32..][0..46].*);

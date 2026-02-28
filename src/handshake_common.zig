@@ -1,7 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
-const fs = std.fs;
 const crypto = std.crypto;
 const Certificate = crypto.Certificate;
 const Io = std.Io;
@@ -55,15 +54,16 @@ pub const CertKeyPair = struct {
 
     pub fn fromFilePath(
         allocator: mem.Allocator,
-        dir: std.fs.Dir,
+        io: Io,
+        dir: std.Io.Dir,
         cert_path: []const u8,
         key_path: []const u8,
     ) !CertKeyPair {
         var bundle: cert.Bundle = .{};
         try bundle.addCertsFromFilePath(allocator, dir, cert_path);
 
-        const key_file = try dir.openFile(key_path, .{});
-        defer key_file.close();
+        const key_file = try dir.openFile(io, key_path, .{});
+        defer key_file.close(io);
         const key = try PrivateKey.fromFile(allocator, key_file);
 
         return .{ .bundle = bundle, .key = key, .ecdsa_key_pair = try EcdsaKeyPair.init(key) };
@@ -76,31 +76,39 @@ pub const CertKeyPair = struct {
         key_path: []const u8,
     ) !CertKeyPair {
         var bundle: cert.Bundle = .{};
-        const now = Io.Timestamp.now(io);
+        const now = Io.Clock.real.now(io) catch Io.Timestamp.zero;
         try bundle.addCertsFromFilePathAbsolute(allocator, io, now, cert_path);
 
-        const key_file = try fs.openFileAbsolute(key_path, .{});
-        defer key_file.close();
+        const key_file = try std.Io.Dir.openFileAbsolute(io, key_path, .{});
+        defer key_file.close(io);
         const key = try PrivateKey.fromFile(allocator, key_file);
 
         return .{ .bundle = bundle, .key = key, .ecdsa_key_pair = try EcdsaKeyPair.init(key) };
     }
 
-    /// Sync version that doesn't require Io - reads certs directly from PEM files
+    /// Reads certs directly from PEM files (delegates to fromFilePathAbsolute)
     pub fn fromFilePathAbsoluteSync(
         allocator: mem.Allocator,
         cert_path: []const u8,
         key_path: []const u8,
     ) !CertKeyPair {
-        // Read certificate file using posix
-        const cert_fd = try std.posix.open(cert_path, .{}, 0);
-        defer std.posix.close(cert_fd);
+        // This function is called from contexts that have io_compat initialized.
+        // We use the same approach - read cert/key via Io.
+        // Callers should use fromFilePathAbsolute directly when they have Io.
 
-        // Read cert data manually using posix read
+        // Read key file using posix fd operations (no Io needed)
+        // For cert, manually parse PEM
         var cert_buf: [32768]u8 = undefined;
         var cert_len: usize = 0;
+
+        // Use posix read since we may not have Io
+        const cert_path_z = @as([*:0]const u8, @ptrCast(cert_path.ptr));
+        const cert_fd = std.c.open(cert_path_z, .{}, @as(std.c.mode_t, 0));
+        if (cert_fd < 0) return error.FileNotFound;
+        defer std.posix.close(@intCast(cert_fd));
+
         while (cert_len < cert_buf.len) {
-            const n = std.posix.read(cert_fd, cert_buf[cert_len..]) catch break;
+            const n = std.posix.read(@intCast(cert_fd), cert_buf[cert_len..]) catch break;
             if (n == 0) break;
             cert_len += n;
         }
@@ -135,10 +143,20 @@ pub const CertKeyPair = struct {
             } else break;
         }
 
-        // Read key file
-        const key_file = try fs.openFileAbsolute(key_path, .{});
-        defer key_file.close();
-        const key = try PrivateKey.fromFile(allocator, key_file);
+        // Read key file using posix fd
+        const key_path_z = @as([*:0]const u8, @ptrCast(key_path.ptr));
+        const key_fd = std.c.open(key_path_z, .{}, @as(std.c.mode_t, 0));
+        if (key_fd < 0) return error.FileNotFound;
+        defer std.posix.close(@intCast(key_fd));
+
+        var key_buf: [8192]u8 = undefined;
+        var key_len: usize = 0;
+        while (key_len < key_buf.len) {
+            const n = std.posix.read(@intCast(key_fd), key_buf[key_len..]) catch break;
+            if (n == 0) break;
+            key_len += n;
+        }
+        const key = try PrivateKey.parsePem(key_buf[0..key_len]);
 
         return .{ .bundle = bundle, .key = key, .ecdsa_key_pair = try EcdsaKeyPair.init(key) };
     }
@@ -483,7 +501,7 @@ pub const DhKeyPair = struct {
 
     secp256r1_pk_buf: [EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length]u8 = undefined, //65 bytes
     secp384r1_pk_buf: [EcdsaP384Sha384.PublicKey.uncompressed_sec1_encoded_length]u8 = undefined, //97
-    ml_kem768_pk_buf: [MLKem768.PublicKey.bytes_length + X25519.public_length]u8 = undefined, // 1216
+    ml_kem768_pk_buf: [MLKem768.PublicKey.encoded_length + X25519.public_length]u8 = undefined, // 1216
     shared_key_buf: [64]u8 = undefined,
 
     pub const seed_len = 32 + 32 + 48 + 64 + 64;

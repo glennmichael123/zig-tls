@@ -2,6 +2,7 @@
 const std = @import("std");
 const der = @import("der.zig");
 const ff = std.crypto.ff;
+const rng = @import("../random.zig");
 
 pub const max_modulus_bits = 4096;
 const max_modulus_len = max_modulus_bits / 8;
@@ -74,7 +75,9 @@ pub const PublicKey = struct {
         // Section: 7.2.1
         // PS consists of pseudo-randomly generated nonzero octets.
         for (ps) |*v| {
-            v.* = std.crypto.random.uintLessThan(u8, 0xff) + 1;
+            var rnd_byte: [1]u8 = undefined;
+            rng.fill(&rnd_byte);
+            v.* = if (rnd_byte[0] == 0) 1 else rnd_byte[0];
         }
 
         em[em.len - msg.len - 1] = 0;
@@ -104,7 +107,7 @@ pub const PublicKey = struct {
         var em = out[0..k];
         em[0] = 0;
         const seed = em[1..][0..Hash.digest_length];
-        std.crypto.random.bytes(seed);
+        rng.fill(seed);
 
         // DB = lHash || PS || 0x01 || M.
         var db = em[1 + seed.len ..];
@@ -513,7 +516,7 @@ pub fn Pss(comptime Hash: type) type {
 
                 const salt = if (self.salt) |s| s else brk: {
                     var res: [default_salt_len]u8 = undefined;
-                    std.crypto.random.bytes(&res);
+                    rng.fill(&res);
                     break :brk &res;
                 };
 

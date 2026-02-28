@@ -11,6 +11,8 @@ const Record = record.Record;
 const Transcript = @import("transcript.zig").Transcript;
 const proto = @import("protocol.zig");
 
+const csprng = @import("random.zig").csprng;
+
 // tls 1.2 cbc cipher types
 const CbcAes128Sha1 = CbcType(crypto.core.aes.Aes128, Sha1);
 const CbcAes128Sha256 = CbcType(crypto.core.aes.Aes128, Sha256);
@@ -246,7 +248,7 @@ fn Aead12Type(comptime AeadType: type) type {
         decrypt_iv: [iv_len]u8,
         encrypt_seq: u64 = 0,
         decrypt_seq: u64 = 0,
-        rnd: std.Random = crypto.random,
+        rnd: std.Random = csprng,
 
         const Self = @This();
 
@@ -564,7 +566,7 @@ fn CbcType(comptime BlockCipher: type, comptime HashType: type) type {
         decrypt_key: [key_len]u8,
         encrypt_seq: u64 = 0,
         decrypt_seq: u64 = 0,
-        rnd: std.Random = crypto.random,
+        rnd: std.Random = csprng,
 
         const Self = @This();
 

@@ -455,7 +455,7 @@ test "client/server connection" {
         const cipher_suite: CipherSuite = .AES_256_GCM_SHA384;
 
         var rnd: [128]u8 = undefined;
-        std.crypto.random.bytes(&rnd);
+        @import("random.zig").fill(&rnd);
         const secret = Transcript.Secret{
             .client = rnd[0..64],
             .server = rnd[64..],
