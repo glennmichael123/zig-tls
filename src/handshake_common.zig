@@ -76,7 +76,7 @@ pub const CertKeyPair = struct {
         key_path: []const u8,
     ) !CertKeyPair {
         var bundle: cert.Bundle = .{};
-        const now = Io.Clock.real.now(io) catch Io.Timestamp.zero;
+        const now = Io.Clock.real.now(io);
         try bundle.addCertsFromFilePathAbsolute(allocator, io, now, cert_path);
 
         const key_file = try std.Io.Dir.openFileAbsolute(io, key_path, .{});
